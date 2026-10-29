@@ -24,7 +24,18 @@ const FILE_PATH =
   (process.env.VERCEL ? "/tmp/hocau-data.json" : join(dirname(fileURLToPath(import.meta.url)), "data.json"));
 
 export function emptyDb() {
-  return { users: [], sessions: [], states: {}, friendRequests: [], teams: [], seq: 1 };
+  return {
+    users: [],
+    sessions: [],
+    states: {},
+    friendRequests: [],
+    teams: [],
+    worldBoss: null,
+    inbox: [],
+    chats: [],
+    giftLog: [],
+    seq: 1,
+  };
 }
 
 function normalize(parsed) {

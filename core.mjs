@@ -164,6 +164,7 @@ function publicTeam(team) {
     desc: team.desc,
     leaderId: team.leaderId,
     createdAt: team.createdAt,
+    score: Number(team.score) || 0,
     memberCount: team.members.length,
     members: team.members.map((m) => {
       const user = db.users.find((u) => u.id === m.userId);
@@ -174,6 +175,7 @@ function publicTeam(team) {
         displayName: user?.displayName ?? m.userId,
         role: m.userId === team.leaderId ? "leader" : "member",
         joinedAt: m.joinedAt,
+        contrib: Number(m.contrib) || 0,
         level: profile?.level ?? 1,
         xp: profile?.xp ?? 0,
         bestScore: profile?.bestScore ?? 0,
@@ -193,6 +195,113 @@ function rateLimited(key, limit, windowMs) {
   bucket.push(now);
   rateBuckets.set(key, bucket);
   return bucket.length > limit;
+}
+
+/* ------------------------------------------------------------------ */
+/* Boss thế giới + hộp thư + chat (đợt 4)                              */
+/* ------------------------------------------------------------------ */
+
+const WORLD_BOSSES = [
+  { name: "Mực Quỷ Biển Sâu", emoji: "🦑" },
+  { name: "Cá Mập Cổ Đại Megalodon", emoji: "🦈" },
+  { name: "Bạch Tuộc Kraken", emoji: "🐙" },
+  { name: "Rùa Thần Ngàn Năm", emoji: "🐢" },
+  { name: "Cá Voi Bóng Ma", emoji: "🐋" },
+  { name: "Rồng Biển Leviathan", emoji: "🐉" },
+];
+const BOSS_HITS_PER_DAY = 10;
+const dayKeyUtc = () => new Date().toISOString().slice(0, 10);
+
+function spawnWorldBoss(cycle) {
+  const def = WORLD_BOSSES[(cycle - 1) % WORLD_BOSSES.length];
+  return {
+    cycle,
+    name: def.name,
+    emoji: def.emoji,
+    maxHp: 1500 + (cycle - 1) * 600,
+    hp: 1500 + (cycle - 1) * 600,
+    contributions: {},
+    hits: {},
+    spawnedAt: Date.now(),
+  };
+}
+
+/** Khi boss bị hạ: chia quỹ thưởng theo tỉ lệ sát thương, gửi vào hộp thư từng người. */
+function settleWorldBoss(boss, killerId) {
+  const entries = Object.entries(boss.contributions).filter(([, dmg]) => dmg > 0);
+  const totalDamage = entries.reduce((sum, [, dmg]) => sum + dmg, 0);
+  if (totalDamage <= 0) return;
+  const pool = 1000 + (boss.cycle - 1) * 200;
+  for (const [userId, dmg] of entries) {
+    const share = Math.max(10, Math.floor((pool * dmg) / totalDamage));
+    db.inbox.push({
+      id: nextId("ib"),
+      toId: userId,
+      fromId: null,
+      fromName: "Boss thế giới",
+      kind: "boss",
+      coins: share,
+      text: `Bạn gây ${dmg} sát thương lên ${boss.emoji} ${boss.name} (chu kỳ ${boss.cycle}) — phần thưởng ${share} xu.`,
+      createdAt: Date.now(),
+      claimedAt: null,
+    });
+  }
+  const killer = db.users.find((u) => u.id === killerId);
+  db.chats.push({
+    id: nextId("chat"),
+    scope: "global",
+    fromId: null,
+    fromName: "📣 Cảng Online",
+    text: `${boss.emoji} Boss thế giới "${boss.name}" (chu kỳ ${boss.cycle}) đã bị hạ${killer ? ` bởi đòn kết liễu của ${killer.displayName}` : ""}! Thưởng đã gửi vào hộp thư của mọi ngư dân tham gia.`,
+    createdAt: Date.now(),
+  });
+}
+
+function ensureWorldBoss() {
+  if (!db.worldBoss) {
+    db.worldBoss = spawnWorldBoss(1);
+    saveDb();
+  }
+  return db.worldBoss;
+}
+
+function publicWorldBoss(boss, meId) {
+  const today = dayKeyUtc();
+  const myHit = boss.hits[meId];
+  const hitsUsed = myHit && myHit.day === today ? myHit.count : 0;
+  const top = Object.entries(boss.contributions)
+    .filter(([, dmg]) => dmg > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([userId, dmg]) => {
+      const user = db.users.find((u) => u.id === userId);
+      return { userId, displayName: user?.displayName ?? userId, damage: dmg };
+    });
+  return {
+    cycle: boss.cycle,
+    name: boss.name,
+    emoji: boss.emoji,
+    maxHp: boss.maxHp,
+    hp: boss.hp,
+    totalDamage: boss.maxHp - boss.hp,
+    myDamage: boss.contributions[meId] ?? 0,
+    hitsLeft: Math.max(0, BOSS_HITS_PER_DAY - hitsUsed),
+    hitsPerDay: BOSS_HITS_PER_DAY,
+    top,
+    spawnedAt: boss.spawnedAt,
+  };
+}
+
+function publicInboxItem(item) {
+  return {
+    id: item.id,
+    kind: item.kind,
+    coins: item.coins,
+    text: item.text,
+    fromName: item.fromName,
+    createdAt: item.createdAt,
+    claimed: !!item.claimedAt,
+  };
 }
 
 export async function handleApi(req, res) {
@@ -378,7 +487,7 @@ export async function handleApi(req, res) {
       const results = db.teams
         .filter((t) => !q || t.name.toLowerCase().includes(q))
         .map((t) => publicTeam(t))
-        .sort((a, b) => b.totalXp - a.totalXp)
+        .sort((a, b) => b.score - a.score || b.totalXp - a.totalXp)
         .slice(0, 30);
       return send(res, 200, { results });
     }
@@ -446,6 +555,148 @@ export async function handleApi(req, res) {
       const team = db.teams.find((t) => t.id === teamDetail[1]);
       if (!team) return send(res, 404, { error: "Không tìm thấy tổ đội." });
       return send(res, 200, { team: publicTeam(team) });
+    }
+
+    /* ---------------- Đóng góp điểm tổ đội ---------------- */
+    if (path === "/api/teams/contribute" && method === "POST") {
+      if (!needAuth()) return;
+      if (rateLimited(`contrib:${me.id}`, 60, 60_000)) return send(res, 429, { error: "Đóng góp quá nhanh, thử lại sau." });
+      const body = await readBody(req);
+      const points = Math.max(1, Math.min(50, Math.floor(Number(body.points) || 0)));
+      if (!points) return send(res, 400, { error: "Điểm đóng góp không hợp lệ." });
+      const team = teamOf(me.id);
+      if (!team) return send(res, 400, { error: "Bạn chưa có tổ đội để đóng góp điểm." });
+      team.score = (Number(team.score) || 0) + points;
+      const member = team.members.find((m) => m.userId === me.id);
+      if (member) member.contrib = (Number(member.contrib) || 0) + points;
+      saveDb();
+      return send(res, 200, { ok: true, score: team.score, myContrib: member?.contrib ?? 0 });
+    }
+
+    /* ---------------- Boss thế giới ---------------- */
+    if (path === "/api/worldboss" && method === "GET") {
+      if (!needAuth()) return;
+      const boss = ensureWorldBoss();
+      return send(res, 200, { boss: publicWorldBoss(boss, me.id) });
+    }
+
+    if (path === "/api/worldboss/hit" && method === "POST") {
+      if (!needAuth()) return;
+      if (rateLimited(`bosshit:${me.id}`, 30, 60_000)) return send(res, 429, { error: "Ra đòn quá nhanh, nghỉ tay một chút." });
+      const boss = ensureWorldBoss();
+      const today = dayKeyUtc();
+      const myHit = boss.hits[me.id];
+      const hitsUsed = myHit && myHit.day === today ? myHit.count : 0;
+      if (hitsUsed >= BOSS_HITS_PER_DAY) {
+        return send(res, 429, { error: `Bạn đã hết ${BOSS_HITS_PER_DAY} lượt đánh boss hôm nay — mai quay lại nhé.` });
+      }
+      const summary = db.states[me.id]?.summary ?? {};
+      const level = Math.max(1, Number(summary.level) || 1);
+      const damage = 25 + level * 4 + Math.floor(Math.random() * 21);
+      boss.hits[me.id] = { day: today, count: hitsUsed + 1 };
+      boss.contributions[me.id] = (boss.contributions[me.id] ?? 0) + damage;
+      boss.hp = Math.max(0, boss.hp - damage);
+      let killed = false;
+      if (boss.hp <= 0) {
+        killed = true;
+        settleWorldBoss(boss, me.id);
+        db.worldBoss = spawnWorldBoss(boss.cycle + 1);
+      }
+      saveDb();
+      return send(res, 200, { ok: true, damage, killed, boss: publicWorldBoss(db.worldBoss, me.id) });
+    }
+
+    /* ---------------- Hộp thư & tặng quà ---------------- */
+    if (path === "/api/inbox" && method === "GET") {
+      if (!needAuth()) return;
+      const items = db.inbox
+        .filter((i) => i.toId === me.id)
+        .sort((a, b) => Number(!!a.claimedAt) - Number(!!b.claimedAt) || b.createdAt - a.createdAt)
+        .slice(0, 50)
+        .map(publicInboxItem);
+      return send(res, 200, { items, unclaimed: items.filter((i) => !i.claimed).length });
+    }
+
+    if (path === "/api/inbox/claim" && method === "POST") {
+      if (!needAuth()) return;
+      const body = await readBody(req);
+      const item = db.inbox.find((i) => i.id === body.id && i.toId === me.id);
+      if (!item) return send(res, 404, { error: "Không tìm thấy thư/quà này." });
+      if (item.claimedAt) return send(res, 409, { error: "Mục này đã nhận rồi." });
+      item.claimedAt = Date.now();
+      saveDb();
+      return send(res, 200, { ok: true, coins: item.coins });
+    }
+
+    if (path === "/api/friends/gift" && method === "POST") {
+      if (!needAuth()) return;
+      const body = await readBody(req);
+      const target = db.users.find((u) => u.id === body.toId);
+      if (!target) return send(res, 404, { error: "Không tìm thấy người chơi đó." });
+      if (relationBetween(me.id, target.id) !== "friend") {
+        return send(res, 400, { error: "Chỉ tặng quà được cho bạn bè đã kết bạn." });
+      }
+      const today = dayKeyUtc();
+      db.giftLog = db.giftLog.filter((g) => g.day === today);
+      if (db.giftLog.some((g) => g.fromId === me.id && g.toId === target.id)) {
+        return send(res, 409, { error: "Hôm nay bạn đã tặng quà cho bạn này rồi — mai tặng tiếp nhé." });
+      }
+      db.giftLog.push({ fromId: me.id, toId: target.id, day: today });
+      db.inbox.push({
+        id: nextId("ib"),
+        toId: target.id,
+        fromId: me.id,
+        fromName: me.displayName,
+        kind: "gift",
+        coins: 30,
+        text: `${me.displayName} gửi tặng bạn 30 xu — chúc ra khơi may mắn! 🎁`,
+        createdAt: Date.now(),
+        claimedAt: null,
+      });
+      saveDb();
+      return send(res, 201, { ok: true });
+    }
+
+    /* ---------------- Trò chuyện ---------------- */
+    if (path === "/api/chat" && method === "GET") {
+      if (!needAuth()) return;
+      const scopeParam = url.searchParams.get("scope") === "team" ? "team" : "global";
+      let scopeKey = "global";
+      if (scopeParam === "team") {
+        const team = teamOf(me.id);
+        if (!team) return send(res, 200, { messages: [], scope: "team", teamName: null });
+        scopeKey = `team:${team.id}`;
+      }
+      const messages = db.chats
+        .filter((c) => c.scope === scopeKey)
+        .slice(-50)
+        .map((c) => ({
+          id: c.id,
+          fromName: c.fromName ?? db.users.find((u) => u.id === c.fromId)?.displayName ?? "Ngư dân",
+          text: c.text,
+          createdAt: c.createdAt,
+          mine: c.fromId === me.id,
+          system: !c.fromId,
+        }));
+      return send(res, 200, { messages, scope: scopeParam });
+    }
+
+    if (path === "/api/chat" && method === "POST") {
+      if (!needAuth()) return;
+      if (rateLimited(`chat:${me.id}`, 15, 30_000)) return send(res, 429, { error: "Bạn nhắn quá nhanh, chờ một chút." });
+      const body = await readBody(req);
+      const text = String(body.text ?? "").trim().slice(0, 200);
+      if (!text) return send(res, 400, { error: "Tin nhắn trống." });
+      let scopeKey = "global";
+      if (body.scope === "team") {
+        const team = teamOf(me.id);
+        if (!team) return send(res, 400, { error: "Bạn chưa có tổ đội để chat đội." });
+        scopeKey = `team:${team.id}`;
+      }
+      db.chats.push({ id: nextId("chat"), scope: scopeKey, fromId: me.id, fromName: me.displayName, text, createdAt: Date.now() });
+      if (db.chats.length > 600) db.chats = db.chats.slice(-600);
+      saveDb();
+      return send(res, 201, { ok: true });
     }
 
     return send(res, 404, { error: "Đường dẫn không tồn tại." });
