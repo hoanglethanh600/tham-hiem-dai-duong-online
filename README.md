@@ -9,3 +9,5 @@
 - Game tự điền sẵn địa chỉ máy chủ này trong mục "Online & tổ đội".
 
 © 2026 By Hoàng Kim Long - Email: tonyhoang.oliver@gmail.com
+
+<!-- v15.1: deploy lại sau khi nối Upstash KV -->
